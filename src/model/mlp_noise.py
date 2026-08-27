@@ -8,6 +8,7 @@ import ot as pot
 import torchdyn
 from torchdyn.core import NeuralODE
 import pytorch_lightning as pl
+from pytorch_lightning.loggers import WandbLogger
 from torch import optim
 import torch.functional as F
 import wandb
@@ -352,8 +353,7 @@ class Noise_MLP_Cond_Memory_Module(pl.LightningModule):
                                 noise_pred, 
                                t_span=full_time,
                                title="{}_trajectory_patient_{}".format(mode, batch_idx))
-        if self.logger:
-            # may cause problem if wandb disabled
+        if isinstance(self.logger, WandbLogger):
             self.logger.experiment.log({"{}_trajectory_patient_{}".format(mode, batch_idx): wandb.Image(fig)})
         
         plt.close(fig)

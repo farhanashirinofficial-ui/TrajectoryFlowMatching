@@ -23,9 +23,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 import hydra
 from omegaconf import OmegaConf
 import pytorch_lightning as pl
-from hydra.utils import instantiate
-
-from pytorch_lightning.strategies import DDPStrategy
+from hydra.utils import instantiate, to_absolute_path
 
 @hydra.main(config_path="conf", config_name="config")
 def train_model(cfg):
@@ -71,19 +69,26 @@ def train_model(cfg):
     wandb_config['t_headings'] = data_module.t_headings
     wandb_config['seed'] = cfg.seed
 
+    wandb_logger = None
+    wandb_run = None
     if cfg.wandb_logging and not(cfg.skip_training):
-        wandb.init(project="clinical_trajectory",
-                    dir = '/home/mila/x/xi.zhang/scratch/shung_ICU/wandb_log/',
-                    config = wandb_config
-                    )
-        wandb_logger = WandbLogger()
+        wandb_savedir = to_absolute_path(cfg.wandb_dir)
+        os.makedirs(wandb_savedir, exist_ok=True)
+        wandb_run = wandb.init(
+            project=cfg.wandb_project,
+            dir=wandb_savedir,
+            config=wandb_config,
+        )
+        wandb_logger = WandbLogger(experiment=wandb_run)
 
-    ckpt_savedir = '/home/mila/x/xi.zhang/scratch/shung_ICU/checkpoints/'+model.naming+'_'+data_module.naming+'/'
-    if not os.path.exists(ckpt_savedir):
-        os.makedirs(ckpt_savedir)
+    ckpt_savedir = os.path.join(
+        to_absolute_path(cfg.ckpt_dir),
+        model.naming + '_' + data_module.naming,
+    )
+    os.makedirs(ckpt_savedir, exist_ok=True)
 
     checkpoint_callback = ModelCheckpoint(
-        dirpath='/home/mila/x/xi.zhang/scratch/shung_ICU/checkpoints/'+model.naming+'_'+data_module.naming+'/',
+        dirpath=ckpt_savedir,
         filename='best_model',
         save_top_k=1,
         verbose=True,
@@ -99,17 +104,21 @@ def train_model(cfg):
         mode='min'
     )
 
-    strategy_ddps = DDPStrategy(find_unused_parameters=True)
-
     trainer = pl.Trainer(
         max_epochs=cfg.max_epochs,
         max_time=cfg.max_time, 
+        # Preserve the authors' effective baseline behavior. Note that
+        # conf/config.yaml currently declares 10, but the original runner used 50.
         check_val_every_n_epoch=50,
         callbacks=[checkpoint_callback, early_stopping_callback],
         accelerator='gpu' if torch.cuda.is_available() else 'cpu',
-        logger=wandb_logger if cfg.wandb_logging else None,
-        limit_train_batches=0 if cfg.skip_training else 1.0,
-        strategy=strategy_ddps,
+        devices=1,
+        logger=wandb_logger if wandb_logger is not None else False,
+        limit_train_batches=0 if cfg.skip_training else cfg.limit_train_batches,
+        limit_val_batches=cfg.limit_val_batches,
+        limit_test_batches=cfg.limit_test_batches,
+        num_sanity_val_steps=cfg.num_sanity_val_steps,
+        strategy='auto',
     )
 
     # Train the model
@@ -118,7 +127,8 @@ def train_model(cfg):
     # Test the model
     trainer.test(model, datamodule=data_module)
 
-    wandb.finish()
+    if wandb_run is not None:
+        wandb.finish()
 
 def main():
     train_model()

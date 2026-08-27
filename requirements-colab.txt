@@ -1,0 +1,16 @@
+# Colab supplies the CUDA-compatible torch build; do not replace it here.
+# Use Colab runtime version 2025.07 (Python 3.11, PyTorch 2.6.0).
+numpy==1.26.4
+pandas==1.5.3
+pytorch-lightning==1.9.5
+torchmetrics==0.11.4
+hydra-core==1.3.2
+omegaconf==2.3.0
+torchdyn==1.0.6
+torchdiffeq==0.2.5
+torchsde==0.2.6
+POT==0.9.5
+scipy==1.13.1
+scikit-learn==1.5.0
+matplotlib==3.9.0
+wandb==0.17.1

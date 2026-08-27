@@ -11,5 +11,9 @@ max_epochs: 200
 max_time: 00:48:00:00
 check_val_every_n_epoch: 10
 skip_training: false
+limit_train_batches: 1.0
+limit_val_batches: 1.0
+limit_test_batches: 1.0
+num_sanity_val_steps: 2
 mode: None 
 seed: 42

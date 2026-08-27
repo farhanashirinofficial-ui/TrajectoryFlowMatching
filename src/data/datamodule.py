@@ -2,6 +2,7 @@ import pytorch_lightning as pl
 import pandas as pd
 import pickle
 import numpy as np
+from hydra.utils import to_absolute_path
 
 # from pytorch_lightning.utilities.types import EVAL_DATALOADERS
 from torch.utils.data import Dataset, DataLoader
@@ -79,7 +80,35 @@ class clinical_DataModule(pl.LightningDataModule):
         return sample
     
     def setup(self, stage=None):
-        self.data = pd.read_pickle(self.file_path)
+        if not self.file_path:
+            raise ValueError("data_module.file_path must be configured")
+
+        data_path = to_absolute_path(self.file_path)
+        self.data = pd.read_pickle(data_path)
+
+        required_splits = {"train", "val", "test"}
+        missing_splits = required_splits.difference(self.data.keys())
+        if missing_splits:
+            raise ValueError(
+                f"Dataset {data_path} is missing required splits: "
+                f"{sorted(missing_splits)}"
+            )
+
+        time_columns = ([self.t_headings] if isinstance(self.t_headings, str)
+                        else list(self.t_headings))
+        required_columns = {
+            "HADM_ID", *self.x_headings, *self.cond_headings, *time_columns
+        }
+        for split_name in required_splits:
+            missing_columns = required_columns.difference(
+                self.data[split_name].columns
+            )
+            if missing_columns:
+                raise ValueError(
+                    f"Dataset split '{split_name}' is missing required columns: "
+                    f"{sorted(missing_columns)}"
+                )
+
         if stage == 'fit' or stage is None:
             self.train = self.__filter_data(self.data['train'])
             self.val = self.__filter_data(self.data['val'])

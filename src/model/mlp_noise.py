@@ -57,6 +57,9 @@ class MLP_conditional_memory(torch.nn.Module):
         )
         self.default_class = 0
         self.clip = clip
+        self.diagnostic_callback = None
+        self.diagnostic_context = {}
+        self.last_diagnostic_tensors = {}
         # self.encoding_function = positional_encoding_tensor()
 
     def encoding_function(self, time_tensor):
@@ -87,6 +90,24 @@ class MLP_conditional_memory(torch.nn.Module):
             vt = (x1_coord - x_coord)/(pred_time_till_t1)
         else:
             vt = (x1_coord - x_coord)/torch.clip((pred_time_till_t1),min=self.clip)
+
+        if self.diagnostic_callback is not None:
+            numerator = x1_coord - x_coord
+            clipped_pred_time = (pred_time_till_t1 if self.clip is None else
+                                 torch.clip(pred_time_till_t1, min=self.clip))
+            tensors = {
+                "raw_predicted_futuretime": pred_time_till_t1,
+                "clipped_predicted_futuretime": clipped_pred_time,
+                "numerator": numerator,
+                "resulting_drift": vt,
+            }
+            self.last_diagnostic_tensors = tensors
+            if any(not torch.isfinite(value).all() for value in tensors.values()):
+                self.diagnostic_callback(
+                    "MLP_conditional_memory.forward",
+                    tensors,
+                    self.diagnostic_context,
+                )
 
         final_vt = torch.cat([vt, torch.zeros_like(x[:,self.dim:-1])], dim=1)
         return final_vt
@@ -214,6 +235,83 @@ class Noise_MLP_Cond_Memory_Module(pl.LightningModule):
         self.clip = clip
         if self.memory > 1:
             self.naming += "_Memory_"+str(self.memory)
+        self._diag_first_event_reported = False
+        self._diag_stage_counts = {}
+        self._diag_test_trajectories = 0
+        self._diag_affected_trajectories = 0
+        self._diag_current_test_batch = None
+        self.flow_model.diagnostic_callback = self._diagnostic_event
+        self.noise_model.diagnostic_callback = self._diagnostic_event
+
+    @staticmethod
+    def _tensor_diagnostic_summary(name, value):
+        tensor = value.detach()
+        finite = torch.isfinite(tensor)
+        finite_values = tensor[finite]
+        minimum = (finite_values.min().item()
+                   if finite_values.numel() else float("nan"))
+        maximum = (finite_values.max().item()
+                   if finite_values.numel() else float("nan"))
+        return (
+            f"{name}: shape={tuple(tensor.shape)} "
+            f"nonfinite={int((~finite).sum().item())} "
+            f"finite_min={minimum:.8g} finite_max={maximum:.8g}"
+        )
+
+    def _diagnostic_event(self, stage, tensors, context=None):
+        self._diag_stage_counts[stage] = self._diag_stage_counts.get(stage, 0) + 1
+        if self._diag_first_event_reported:
+            return
+        self._diag_first_event_reported = True
+        context = context or {}
+        context_text = " ".join(f"{key}={value}" for key, value in context.items())
+        print(f"[TFM-DIAG][FIRST-NONFINITE] stage={stage} {context_text}")
+        for name, value in tensors.items():
+            print(
+                "[TFM-DIAG][FIRST-NONFINITE] "
+                + self._tensor_diagnostic_summary(name, value)
+            )
+
+    def on_test_start(self):
+        print("[TFM-DIAG][parameters] checking immediately before test")
+        for model_name, model in (
+            ("flow_model", self.flow_model),
+            ("noise_model", self.noise_model),
+        ):
+            total = 0
+            nonfinite = 0
+            max_abs = 0.0
+            first_bad_parameter = None
+            for parameter in model.parameters():
+                values = parameter.detach()
+                total += values.numel()
+                finite = torch.isfinite(values)
+                nonfinite += int((~finite).sum().item())
+                if not finite.all() and first_bad_parameter is None:
+                    first_bad_parameter = values
+                if finite.any():
+                    max_abs = max(max_abs, values[finite].abs().max().item())
+            print(
+                f"[TFM-DIAG][parameters][{model_name}] total={total} "
+                f"nonfinite={nonfinite} max_abs_finite={max_abs:.8g}"
+            )
+            if first_bad_parameter is not None:
+                self._diagnostic_event(
+                    "on_test_start.parameters",
+                    {f"{model_name}_parameter": first_bad_parameter},
+                    {"model": model_name},
+                )
+
+    def on_test_end(self):
+        stage_counts = ", ".join(
+            f"{stage}={count}" for stage, count in sorted(self._diag_stage_counts.items())
+        ) or "none"
+        print(
+            f"[TFM-DIAG][summary] test_trajectories={self._diag_test_trajectories} "
+            f"affected_trajectories={self._diag_affected_trajectories} "
+            f"first_nonfinite_reported={self._diag_first_event_reported} "
+            f"stage_events={stage_counts}"
+        )
             
     def __convert_tensor__(self, tensor):
         return tensor.to(torch.float32)
@@ -337,6 +435,8 @@ class Noise_MLP_Cond_Memory_Module(pl.LightningModule):
                                x1_values[0,:,:self.dim]], 
                                dim=0)
         full_time = torch.cat([times_x0[0].unsqueeze(0), times_x1], dim=0)
+        self._diag_current_test_batch = batch_idx
+        self._diag_test_trajectories += 1
         ind_loss, pred_traj, noise_mse, noise_pred = self.test_trajectory(batch)
         total_loss.append(ind_loss)
         traj_pairs.append([full_traj, pred_traj])
@@ -346,6 +446,23 @@ class Noise_MLP_Cond_Memory_Module(pl.LightningModule):
         full_traj = full_traj.detach().cpu().numpy()
         pred_traj = pred_traj.detach().cpu().numpy()
         full_time = full_time.detach().cpu().numpy()
+
+        pred_tensor = torch.as_tensor(pred_traj)
+        truth_tensor = torch.as_tensor(full_traj)
+        if not torch.isfinite(pred_tensor).all():
+            self._diag_affected_trajectories += 1
+            self._diagnostic_event(
+                "test_func_step.before_metrics",
+                {"pred_traj": pred_tensor, "full_traj": truth_tensor},
+                {"test_batch": batch_idx},
+            )
+        elif not torch.isfinite(truth_tensor).all():
+            self._diag_affected_trajectories += 1
+            self._diagnostic_event(
+                "test_func_step.nonfinite_truth",
+                {"pred_traj": pred_tensor, "full_traj": truth_tensor},
+                {"test_batch": batch_idx},
+            )
 
         # graph
         fig = plot_3d_path_ind_noise(pred_traj, 
@@ -460,7 +577,11 @@ class Noise_MLP_Cond_Memory_Module(pl.LightningModule):
         Returns:
             mse_all, total_pred_tensor: _description_
         """
-        sde = SDE_func_solver(self.flow_model, noise=self.noise_model)
+        sde = SDE_func_solver(
+            self.flow_model,
+            noise=self.noise_model,
+            diagnostic_callback=self._diagnostic_event,
+        )
         total_pred = []
         mse = []
         noise_pred = []
@@ -490,6 +611,14 @@ class Noise_MLP_Cond_Memory_Module(pl.LightningModule):
 
             time_span = self.__convert_tensor__(torch.linspace(times_x0[i], times_x1[i], 10)).to(x0_values.device)
 
+            diagnostic_context = {
+                "test_batch": self._diag_current_test_batch,
+                "interval": i,
+            }
+            self.flow_model.diagnostic_context = diagnostic_context
+            self.noise_model.diagnostic_context = diagnostic_context
+            sde.diagnostic_context = diagnostic_context
+
             new_x_classes = torch.cat([x0_classes[i][:-(self.memory*self.dim)].unsqueeze(0), time_history.unsqueeze(0)], dim=1)
             with torch.no_grad():
                 # get last pred, if none then use startpt
@@ -497,7 +626,9 @@ class Noise_MLP_Cond_Memory_Module(pl.LightningModule):
                     testpt = torch.cat([x0_values[i].unsqueeze(0),new_x_classes],dim=1)
                 else: # incorporate last prediction
                     testpt = torch.cat([pred_traj, new_x_classes], dim=1)
-                traj, noise_traj = self._sde_solver(sde, testpt, time_span)
+                traj, noise_traj = self._sde_solver(
+                    sde, testpt, time_span, diagnostic_context
+                )
 
             pred_traj = traj[-1,:,:self.dim]
             noise_traj = noise_traj[-1,:,:self.dim]
@@ -523,17 +654,64 @@ class Noise_MLP_Cond_Memory_Module(pl.LightningModule):
         return mse_all, total_pred_tensor, noise_mse_all, noise_pred_tensor
 
 
-    def _sde_solver(self, sde, initial_state, time_span):
+    def _sde_solver(self, sde, initial_state, time_span, diagnostic_context=None):
         dt = time_span[1] - time_span[0]  # Time step
         current_state = initial_state
         trajectory = [current_state]
         noise_trajectory = []
 
-        for t in time_span[1:]:
+        for solver_step, t in enumerate(time_span[1:], start=1):
+            context = dict(diagnostic_context or {})
+            context["solver_step"] = solver_step
+            sde.diagnostic_context = context
+            self.flow_model.diagnostic_context = context
+            self.noise_model.diagnostic_context = context
+
+            if not torch.isfinite(current_state).all():
+                self._diagnostic_event(
+                    "_sde_solver.current_state",
+                    {"current_state": current_state, "dt": dt, "raw_t": t},
+                    context,
+                )
             drift = sde.f(t, current_state)
+            if not torch.isfinite(drift).all():
+                self._diagnostic_event(
+                    "_sde_solver.drift",
+                    {"current_state": current_state, "drift": drift},
+                    context,
+                )
             diffusion = sde.g(t, current_state)
+            if not torch.isfinite(diffusion).all():
+                self._diagnostic_event(
+                    "_sde_solver.diffusion",
+                    {"diffusion": diffusion, "raw_t": t},
+                    context,
+                )
             noise = torch.randn_like(current_state) * torch.sqrt(dt)
-            current_state = current_state + drift * dt + diffusion * noise # @NEED this or not?
+            if not torch.isfinite(noise).all():
+                self._diagnostic_event(
+                    "_sde_solver.noise",
+                    {"noise": noise, "dt": dt},
+                    context,
+                )
+            updated_state = current_state + drift * dt + diffusion * noise # @NEED this or not?
+            if not torch.isfinite(updated_state).all():
+                event_tensors = {
+                    "current_state": current_state,
+                    "drift": drift,
+                    "diffusion": diffusion,
+                    "noise": noise,
+                    "updated_state": updated_state,
+                    "dt": dt,
+                }
+                event_tensors.update(self.flow_model.last_diagnostic_tensors)
+                event_tensors.update(sde.last_diagnostic_tensors)
+                self._diagnostic_event(
+                    "_sde_solver.updated_state",
+                    event_tensors,
+                    context,
+                )
+            current_state = updated_state
             trajectory.append(current_state)
             pred_diff = diffusion * noise
             noise_trajectory.append(pred_diff)

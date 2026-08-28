@@ -109,11 +109,76 @@ class clinical_DataModule(pl.LightningDataModule):
                     f"{sorted(missing_columns)}"
                 )
 
+        if not getattr(self, "_diagnostics_reported", False):
+            self._report_numerical_diagnostics(data_path)
+            self._diagnostics_reported = True
+
         if stage == 'fit' or stage is None:
             self.train = self.__filter_data(self.data['train'])
             self.val = self.__filter_data(self.data['val'])
         if stage == 'test' or stage is None:
             self.test = self.__filter_data(self.data['test'])
+
+    def _report_numerical_diagnostics(self, data_path):
+        """Print read-only dataset diagnostics without transforming the data."""
+        print(f"[TFM-DIAG][data] source={data_path}")
+        value_columns = list(self.x_headings) + list(self.cond_headings)
+        time_column = self.t_headings
+
+        for split_name in ("train", "val", "test"):
+            split = self.data[split_name]
+            diagnostic_columns = value_columns + [time_column]
+            numeric = split[diagnostic_columns].apply(
+                pd.to_numeric, errors="coerce"
+            )
+            values = numeric.to_numpy(dtype=np.float64)
+            nan_count = int(np.isnan(values).sum())
+            posinf_count = int(np.isposinf(values).sum())
+            neginf_count = int(np.isneginf(values).sum())
+
+            times = numeric[time_column].to_numpy(dtype=np.float64)
+            finite_times = times[np.isfinite(times)]
+            time_min = float(finite_times.min()) if finite_times.size else np.nan
+            time_max = float(finite_times.max()) if finite_times.size else np.nan
+            below_zero = int(np.sum(finite_times < 0))
+            above_one = int(np.sum(finite_times > 1))
+
+            deltas = []
+            for _, group in split.groupby("HADM_ID"):
+                patient_times = pd.to_numeric(
+                    group[time_column], errors="coerce"
+                ).sort_values().to_numpy(dtype=np.float64)
+                if patient_times.size > 1:
+                    deltas.append(np.diff(patient_times))
+            deltas = np.concatenate(deltas) if deltas else np.array([])
+            finite_deltas = deltas[np.isfinite(deltas)]
+            delta_min = (float(finite_deltas.min())
+                         if finite_deltas.size else np.nan)
+            delta_max = (float(finite_deltas.max())
+                         if finite_deltas.size else np.nan)
+            negative_deltas = int(np.sum(finite_deltas < 0))
+            zero_deltas = int(np.sum(finite_deltas == 0))
+            invalid_deltas = int(np.sum(~np.isfinite(deltas)))
+
+            print(
+                f"[TFM-DIAG][data][{split_name}] rows={len(split)} "
+                f"patients={split['HADM_ID'].nunique()} nan={nan_count} "
+                f"+inf={posinf_count} -inf={neginf_count} "
+                f"time_min={time_min:.8g} time_max={time_max:.8g} "
+                f"time_lt_0={below_zero} time_gt_1={above_one} "
+                f"dt_min={delta_min:.8g} dt_max={delta_max:.8g} "
+                f"dt_lt_0={negative_deltas} dt_eq_0={zero_deltas} "
+                f"dt_invalid={invalid_deltas}"
+            )
+
+            for column in diagnostic_columns:
+                column_values = numeric[column].to_numpy(dtype=np.float64)
+                invalid = int(np.sum(~np.isfinite(column_values)))
+                if invalid:
+                    print(
+                        f"[TFM-DIAG][data][{split_name}] "
+                        f"column={column} nonfinite={invalid}"
+                    )
 
     def __sort_group__(self, data_set):
         grouped = data_set.groupby('HADM_ID')

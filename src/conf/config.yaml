@@ -7,6 +7,8 @@ wandb_logging: true
 wandb_project: clinical_trajectory
 wandb_dir: wandb_log/
 ckpt_dir: checkpoints/
+results_dir: results/
+resume_ckpt_path: null
 max_epochs: 200
 max_time: 00:48:00:00
 check_val_every_n_epoch: 10

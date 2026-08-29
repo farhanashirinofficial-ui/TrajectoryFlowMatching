@@ -14,6 +14,7 @@ import pandas as pd
 import numpy as np
 import wandb
 from pytorch_lightning.loggers import WandbLogger
+import json
 import os
 
 import pytorch_lightning as pl
@@ -87,6 +88,28 @@ def train_model(cfg):
     )
     os.makedirs(ckpt_savedir, exist_ok=True)
 
+    results_savedir = os.path.join(
+        to_absolute_path(cfg.results_dir),
+        model.naming + '_' + data_module.naming,
+    )
+    os.makedirs(results_savedir, exist_ok=True)
+
+    resume_ckpt_path = (
+        to_absolute_path(cfg.resume_ckpt_path)
+        if cfg.resume_ckpt_path is not None
+        else None
+    )
+
+    print(f"[experiment] seed={cfg.seed}")
+    print(f"[experiment] checkpoint_dir={ckpt_savedir}")
+    print(f"[experiment] results_dir={results_savedir}")
+    print(f"[experiment] resume_ckpt_path={resume_ckpt_path}")
+
+    resolved_config_path = os.path.join(results_savedir, 'resolved_config.yaml')
+    with open(resolved_config_path, 'w', encoding='utf-8') as config_file:
+        config_file.write(OmegaConf.to_yaml(cfg, resolve=True))
+    print(f"[experiment] resolved_config={resolved_config_path}")
+
     checkpoint_callback = ModelCheckpoint(
         dirpath=ckpt_savedir,
         filename='best_model',
@@ -95,6 +118,17 @@ def train_model(cfg):
         monitor='val_loss',
         mode='min',
         save_last=True
+    )
+
+    recovery_checkpoint_callback = ModelCheckpoint(
+        dirpath=os.path.join(ckpt_savedir, 'recovery'),
+        filename='recovery-{epoch:04d}-{step}',
+        save_top_k=-1,
+        save_last=True,
+        every_n_epochs=5,
+        save_on_train_epoch_end=True,
+        save_weights_only=False,
+        verbose=True,
     )
 
     early_stopping_callback = EarlyStopping(
@@ -107,10 +141,12 @@ def train_model(cfg):
     trainer = pl.Trainer(
         max_epochs=cfg.max_epochs,
         max_time=cfg.max_time, 
-        # Preserve the authors' effective baseline behavior. Note that
-        # conf/config.yaml currently declares 10, but the original runner used 50.
-        check_val_every_n_epoch=50,
-        callbacks=[checkpoint_callback, early_stopping_callback],
+        check_val_every_n_epoch=cfg.check_val_every_n_epoch,
+        callbacks=[
+            checkpoint_callback,
+            recovery_checkpoint_callback,
+            early_stopping_callback,
+        ],
         accelerator='gpu' if torch.cuda.is_available() else 'cpu',
         devices=1,
         logger=wandb_logger if wandb_logger is not None else False,
@@ -122,10 +158,31 @@ def train_model(cfg):
     )
 
     # Train the model
-    trainer.fit(model, datamodule=data_module)
+    trainer.fit(
+        model,
+        datamodule=data_module,
+        ckpt_path=resume_ckpt_path,
+    )
 
-    # Test the model
-    trainer.test(model, datamodule=data_module)
+    # Preserve the original evaluation behavior: test the final in-memory model.
+    test_results = trainer.test(model, datamodule=data_module)
+
+    result_payload = {
+        'seed': int(cfg.seed),
+        'model_naming': model.naming,
+        'data_naming': data_module.naming,
+        'resume_ckpt_path': resume_ckpt_path,
+        'resumed': resume_ckpt_path is not None,
+        'test_results': test_results[0] if len(test_results) == 1 else test_results,
+    }
+    result_path = os.path.join(
+        results_savedir,
+        f'final_test_results_seed_{cfg.seed}.json',
+    )
+    with open(result_path, 'w', encoding='utf-8') as result_file:
+        json.dump(result_payload, result_file, indent=2, sort_keys=True)
+
+    print(f"[experiment] final_test_results={result_path}")
 
     if wandb_run is not None:
         wandb.finish()

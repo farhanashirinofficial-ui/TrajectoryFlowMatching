@@ -138,15 +138,15 @@ def train_model(cfg):
         mode='min'
     )
 
+    callbacks = [checkpoint_callback, recovery_checkpoint_callback]
+    if cfg.early_stopping:
+        callbacks.append(early_stopping_callback)
+
     trainer = pl.Trainer(
         max_epochs=cfg.max_epochs,
         max_time=cfg.max_time, 
         check_val_every_n_epoch=cfg.check_val_every_n_epoch,
-        callbacks=[
-            checkpoint_callback,
-            recovery_checkpoint_callback,
-            early_stopping_callback,
-        ],
+        callbacks=callbacks,
         accelerator='gpu' if torch.cuda.is_available() else 'cpu',
         devices=1,
         logger=wandb_logger if wandb_logger is not None else False,

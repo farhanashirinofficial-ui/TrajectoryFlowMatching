@@ -380,7 +380,7 @@ class Noise_MLP_Cond_Memory_Module(pl.LightningModule):
         self.manual_backward(noise_loss)
         noise_opt.step()
         
-        self.log('train_loss', loss)
+        self.log('train_loss', loss, on_epoch=True, on_step=False, sync_dist=True)
         self.log('noise_loss', noise_loss)
         return loss + noise_loss
 

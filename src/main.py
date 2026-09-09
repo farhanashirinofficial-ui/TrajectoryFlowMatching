@@ -25,7 +25,7 @@ import hydra
 from omegaconf import OmegaConf
 import pytorch_lightning as pl
 from hydra.utils import instantiate, to_absolute_path
-
+from utils.training_history_callback import TrainingHistoryCallback
 @hydra.main(config_path="conf", config_name="config")
 def train_model(cfg):
     # set seed
@@ -137,8 +137,10 @@ def train_model(cfg):
         verbose=True,
         mode='min'
     )
-
-    callbacks = [checkpoint_callback, recovery_checkpoint_callback]
+    history_callback = TrainingHistoryCallback(
+    run_dir=to_absolute_path(cfg.results_dir)
+    )
+    callbacks = [checkpoint_callback, recovery_checkpoint_callback, history_callback]
     if cfg.early_stopping:
         callbacks.append(early_stopping_callback)
 
@@ -164,8 +166,12 @@ def train_model(cfg):
         ckpt_path=resume_ckpt_path,
     )
 
-    # Preserve the original evaluation behavior: test the final in-memory model.
-    test_results = trainer.test(model, datamodule=data_module)
+    # Test only when explicitly enabled.
+    if cfg.skip_test:
+      print("[experiment] Test evaluation skipped.")
+      test_results = []
+    else:
+      test_results = trainer.test(model, datamodule=data_module)
 
     result_payload = {
         'seed': int(cfg.seed),
@@ -177,12 +183,12 @@ def train_model(cfg):
     }
     result_path = os.path.join(
         results_savedir,
-        f'final_test_results_seed_{cfg.seed}.json',
+        f'experiment_results_seed_{cfg.seed}.json',
     )
     with open(result_path, 'w', encoding='utf-8') as result_file:
         json.dump(result_payload, result_file, indent=2, sort_keys=True)
 
-    print(f"[experiment] final_test_results={result_path}")
+    print(f"[experiment] results={result_path}")
 
     if wandb_run is not None:
         wandb.finish()

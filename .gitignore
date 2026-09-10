@@ -1,3 +1,20 @@
 src/outputs/*
 outputs/*
 *pycache*
+
+# Local environments, run configuration, and generated artifacts.
+/.venv/
+/.hydra/
+/checkpoints/
+/graphs/
+/results/
+/runs/
+/main.log
+
+# Clinical data and protected development exports.
+/data/eICU_sepsis_tfm.pkl
+/data/eICU_sepsis_train.csv
+/data/eICU_sepsis_val.csv
+
+# Generated analysis artifacts; analysis source scripts remain versioned.
+/analysis/outputs/
